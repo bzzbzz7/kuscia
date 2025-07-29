@@ -15,6 +15,7 @@
 package kusciascheduling
 
 import (
+	"container/list"
 	"sync"
 	"time"
 
@@ -22,70 +23,82 @@ import (
 )
 
 const (
-	// Default cleanup interval for expired cache entries
-	defaultCleanupInterval = time.Hour
+	// Default maximum cache duration (10 days)
+	defaultMaxCacheDuration = 10 * 24 * time.Hour
 
-	// Default maximum cache duration (7 days)
-	defaultMaxCacheDuration = 7 * 24 * time.Hour
+	// Threshold for cleanup check
+	cleanupThreshold = 1000
 )
 
-// JobIDCache manages job ID to node name mappings with expiration
+// JobIDCache manages job ID to node name mappings with expiration and insertion order
 type JobIDCache struct {
-	// Fields reordered for better memory alignment
-	maxCacheTime  time.Duration
-	cache         map[string]cachedEntry
-	mu            sync.RWMutex
-	cleanupTicker *time.Ticker
-	stopChan      chan struct{}
+	maxCacheTime time.Duration
+	cache        map[string]*list.Element // map to list element for O(1) access
+	orderList    *list.List               // maintains insertion order
+	mu           sync.Mutex
 }
 
 // cachedEntry holds a node name and its creation timestamp
 type cachedEntry struct {
+	jobID        string
 	nodeName     string
 	creationTime time.Time
 }
 
 // NewJobIDCache creates a new JobIDCache instance
 func NewJobIDCache() *JobIDCache {
-	cache := &JobIDCache{
-		cache:        make(map[string]cachedEntry),
+	return &JobIDCache{
+		cache:        make(map[string]*list.Element),
+		orderList:    list.New(),
 		maxCacheTime: defaultMaxCacheDuration,
-		stopChan:     make(chan struct{}),
 	}
-
-	// Start cleanup goroutine
-	go cache.runCleanupLoop()
-
-	return cache
 }
 
 // Set adds or updates a job ID to node mapping
+// Also cleans up expired entries from the front of the list when size exceeds threshold
 func (jc *JobIDCache) Set(jobID, nodeName string) {
 	jc.mu.Lock()
 	defer jc.mu.Unlock()
 
-	jc.cache[jobID] = cachedEntry{
+	now := time.Now()
+
+	entry := &cachedEntry{
+		jobID:        jobID,
 		nodeName:     nodeName,
-		creationTime: time.Now(),
+		creationTime: now,
 	}
-	nlog.Debugf("Set job ID %s to node %s in cache", jobID, nodeName)
+
+	// If already exists, update it and move to back
+	if elem, ok := jc.cache[jobID]; ok {
+		elem.Value = entry
+		jc.orderList.MoveToBack(elem)
+		nlog.Debugf("Updated job ID %s to node %s in cache", jobID, nodeName)
+		return
+	}
+
+	// Otherwise, insert new
+	elem := jc.orderList.PushBack(entry)
+	jc.cache[jobID] = elem
+	nlog.Debugf("Inserted job ID %s to node %s in cache", jobID, nodeName)
+
+	// Check if we need to cleanup expired entries
+	if jc.orderList.Len() > cleanupThreshold {
+		jc.cleanupExpired(now)
+	}
 }
 
 // Get retrieves the node name for a given job ID
 func (jc *JobIDCache) Get(jobID string) (string, bool) {
-	jc.mu.RLock()
-	defer jc.mu.RUnlock()
+	jc.mu.Lock()
+	defer jc.mu.Unlock()
 
-	entry, ok := jc.cache[jobID]
+	// Try to get the requested entry
+	elem, ok := jc.cache[jobID]
 	if !ok {
 		return "", false
 	}
 
-	// Check if the entry has expired
-	if time.Since(entry.creationTime) > jc.maxCacheTime {
-		// Entry expired, we'll remove it in the next cleanup cycle
-		return "", false
-	}
+	entry := elem.Value.(*cachedEntry)
 
 	nlog.Debugf("Get node %s for job ID %s from cache", entry.nodeName, jobID)
 	return entry.nodeName, true
@@ -96,41 +109,31 @@ func (jc *JobIDCache) Delete(jobID string) {
 	jc.mu.Lock()
 	defer jc.mu.Unlock()
 
-	delete(jc.cache, jobID)
-	nlog.Debugf("Delete job ID %s from cache", jobID)
-}
-
-// runCleanupLoop periodically cleans up expired entries
-func (jc *JobIDCache) runCleanupLoop() {
-	jc.cleanupTicker = time.NewTicker(defaultCleanupInterval)
-	defer jc.cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-jc.cleanupTicker.C:
-			jc.cleanup()
-		case <-jc.stopChan:
-			return
-		}
+	if elem, ok := jc.cache[jobID]; ok {
+		delete(jc.cache, jobID)
+		jc.orderList.Remove(elem)
+		nlog.Debugf("Deleted job ID %s from cache", jobID)
 	}
 }
 
-// cleanup removes expired entries from the cache
-func (jc *JobIDCache) cleanup() {
-	jc.mu.Lock()
-	defer jc.mu.Unlock()
+// cleanupExpired removes expired entries from the front of the list
+// Only called when cache size exceeds cleanupThreshold
+func (jc *JobIDCache) cleanupExpired(now time.Time) {
+	for jc.orderList.Len() > 0 {
+		front := jc.orderList.Front()
+		entry := front.Value.(*cachedEntry)
 
-	now := time.Now()
-
-	for jobID, entry := range jc.cache {
-		if now.Sub(entry.creationTime) > jc.maxCacheTime {
-			delete(jc.cache, jobID)
-			nlog.Debugf("Cleaned up expired job ID %s from cache", jobID)
+		// Check if the oldest entry is expired
+		if now.Sub(entry.creationTime) <= jc.maxCacheTime {
+			// Oldest entry is not expired, stop cleaning
+			break
 		}
-	}
-}
 
-// Close stops the cleanup goroutine
-func (jc *JobIDCache) Close() {
-	close(jc.stopChan)
+		// Remove expired entry
+		delete(jc.cache, entry.jobID)
+		jc.orderList.Remove(front)
+		nlog.Debugf("Removed expired job ID %s from cache during Set", entry.jobID)
+
+		// Continue to check next oldest entry
+	}
 }
