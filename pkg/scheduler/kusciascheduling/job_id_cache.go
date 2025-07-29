@@ -25,16 +25,16 @@ const (
 	// Default cleanup interval for expired cache entries
 	defaultCleanupInterval = time.Hour
 
-	// Default maximum cache duration (1 week)
+	// Default maximum cache duration (7 days)
 	defaultMaxCacheDuration = 7 * 24 * time.Hour
 )
 
 // JobIDCache manages job ID to node name mappings with expiration
 type JobIDCache struct {
-	mu            sync.RWMutex
-	cache         map[string]cachedEntry
-	cleanupTimer  *time.Timer
+	// Fields reordered for better memory alignment
 	maxCacheTime  time.Duration
+	cache         map[string]cachedEntry
+	mu            sync.RWMutex
 	cleanupTicker *time.Ticker
 	stopChan      chan struct{}
 }
@@ -54,7 +54,7 @@ func NewJobIDCache() *JobIDCache {
 	}
 
 	// Start cleanup goroutine
-	go cache.startCleanup()
+	go cache.runCleanupLoop()
 
 	return cache
 }
@@ -100,8 +100,8 @@ func (jc *JobIDCache) Delete(jobID string) {
 	nlog.Debugf("Delete job ID %s from cache", jobID)
 }
 
-// startCleanup periodically cleans up expired entries
-func (jc *JobIDCache) startCleanup() {
+// runCleanupLoop periodically cleans up expired entries
+func (jc *JobIDCache) runCleanupLoop() {
 	jc.cleanupTicker = time.NewTicker(defaultCleanupInterval)
 	defer jc.cleanupTicker.Stop()
 
