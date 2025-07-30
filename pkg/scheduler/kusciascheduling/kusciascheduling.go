@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -39,10 +40,13 @@ type KusciaScheduling struct {
 	frameworkHandler        framework.Handle
 	trMgr                   core.Manager
 	resourceReservedSeconds *time.Duration
+	jobIDCache              *JobIDCache // New field for job ID cache
 }
 
 var _ framework.PreFilterPlugin = &KusciaScheduling{}
+var _ framework.FilterPlugin = &KusciaScheduling{}
 var _ framework.PostFilterPlugin = &KusciaScheduling{}
+var _ framework.ScorePlugin = &KusciaScheduling{}
 var _ framework.ReservePlugin = &KusciaScheduling{}
 var _ framework.PermitPlugin = &KusciaScheduling{}
 var _ framework.PreBindPlugin = &KusciaScheduling{}
@@ -52,6 +56,11 @@ var _ framework.EnqueueExtensions = &KusciaScheduling{}
 const (
 	// Name is the name of the plugin used in Registry and configurations.
 	Name = "KusciaScheduling"
+
+	// JobIDAnnotationKey is the key for job ID annotation
+	JobIDAnnotationKey = "kuscia.secretflow/job-id"
+
+	JobAffinityAnnotation = "kuscia.secretflow/job-affinity"
 )
 
 // New initializes and returns a new KusciaScheduling plugin.
@@ -83,6 +92,7 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		frameworkHandler:        handle,
 		trMgr:                   trMgr,
 		resourceReservedSeconds: &timeout,
+		jobIDCache:              NewJobIDCache(), // Initialize job ID cache
 	}
 
 	ctx := context.Background()
@@ -132,11 +142,102 @@ func (cs *KusciaScheduling) Name() string {
 // PreFilter performs the following validations.
 // 1. Whether the TaskResourceGroup that the Pod belongs to is on the deny list.
 // 2. Whether the total number of pods in a TaskResourceGroup is less than its `minReservedMember`.
+// 3. Check if the pod needs to be scheduled to the same node as other pods with the same job-id.
 func (cs *KusciaScheduling) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+	var nodeSet sets.Set[string]
+
+	// Check if the pod has job-id annotation and scheduleAffinity is RequireSameNode
+	if jobID := getJobIDFromPod(pod); jobID != "" {
+		// Check if this KusciaJob requires scheduling to the same node
+		if isRequireSameNode(pod) {
+			// Check if we already know which node to schedule this pod to
+			if nodeName, ok := cs.jobIDCache.Get(jobID); ok {
+				if nodeName == "" {
+					nlog.Debugf("Job %s is cached with id but has no nodeName cached, maybe the first pod with the same job id is under binding stage ", jobID)
+					return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, "Job has no node cached")
+				}
+
+				// If we have a node cached for this job ID, we should prefer that node
+				nlog.Debugf("Preferring node %s for pod %s/%s with job-id %s", nodeName, pod.Namespace, pod.Name, jobID)
+				nodeSet = sets.New[string](nodeName)
+			} else {
+				// Add job ID to cache, but don't assign a node yet
+				cs.jobIDCache.Set(jobID, "")
+			}
+		}
+	}
+
 	if err := cs.trMgr.PreFilter(ctx, pod); err != nil {
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	}
-	return nil, framework.NewStatus(framework.Success, "")
+	return &framework.PreFilterResult{
+		NodeNames: nodeSet,
+	}, framework.NewStatus(framework.Success, "")
+}
+
+// Filter implements the filter plugin interface to filter out nodes that don't meet requirements.
+// For pods with job-id requiring same-node scheduling, it ensures they are scheduled to the same node
+// as other pods with the same job-id.
+func (cs *KusciaScheduling) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	node := nodeInfo.Node()
+	if node == nil {
+		return framework.NewStatus(framework.Error, "node not found")
+	}
+
+	// Check if this pod requires same-node scheduling
+	jobID := getJobIDFromPod(pod)
+	if jobID != "" && isRequireSameNode(pod) {
+		// Check if there's already a node assigned for this job ID
+		if nodeName, ok := cs.jobIDCache.Get(jobID); ok {
+			// If there's already a node assigned, ensure this pod is scheduled to the same node
+			if node.Name != nodeName {
+				nlog.Debugf("Pod %s/%s with job-id %s must be scheduled to node %s, but trying to schedule to %s",
+					pod.Namespace, pod.Name, jobID, nodeName, node.Name)
+				return framework.NewStatus(framework.UnschedulableAndUnresolvable,
+					fmt.Sprintf("Pod with job-id %s must be scheduled to node %s", jobID, nodeName))
+			}
+		}
+	}
+
+	return framework.NewStatus(framework.Success, "")
+}
+
+// PreScore implements the prescore plugin interface.
+func (cs *KusciaScheduling) PreScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+	// No special prescore logic needed for now
+	return framework.NewStatus(framework.Success, "")
+}
+
+// Score implements the score plugin interface.
+func (cs *KusciaScheduling) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+	// For pods with job-id requiring same-node scheduling, give higher scores to the node
+	// where other pods with the same job-id are already scheduled
+	jobID := getJobIDFromPod(pod)
+	if jobID != "" && isRequireSameNode(pod) {
+		if cachedNodeName, ok := cs.jobIDCache.Get(jobID); ok {
+			// If there's already a node assigned for this job ID, prefer that node
+			if nodeName == cachedNodeName {
+				// Give the highest score to the preferred node
+				return 100, framework.NewStatus(framework.Success, "")
+			}
+			// Give lower score to other nodes
+			return 10, framework.NewStatus(framework.Success, "")
+		}
+	}
+
+	// Default score for nodes without specific preference
+	return 50, framework.NewStatus(framework.Success, "")
+}
+
+// ScoreExtensions returns the scoring extensions.
+func (cs *KusciaScheduling) ScoreExtensions() framework.ScoreExtensions {
+	return cs
+}
+
+// NormalizeScore normalizes the score for all nodes.
+func (cs *KusciaScheduling) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+	// No normalization needed as we're already returning scores in the correct range
+	return framework.NewStatus(framework.Success, "")
 }
 
 // PostFilter is used to reject a group of pods if a pod does not pass PreFilter or Filter.
@@ -181,6 +282,14 @@ func (cs *KusciaScheduling) PreFilterExtensions() framework.PreFilterExtensions 
 
 // Reserve is the functions invoked by the framework at "reserve" extension point.
 func (cs *KusciaScheduling) Reserve(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) *framework.Status {
+	// cache jobID nodeName relationship.
+	jobID := getJobIDFromPod(pod)
+	if jobID != "" && isRequireSameNode(pod) {
+		// Cache the node assignment for this job ID
+		cs.jobIDCache.Set(jobID, nodeName)
+		nlog.Debugf("Reserved pod %s/%s with job-id %s to node %s", pod.Namespace, pod.Name, jobID, nodeName)
+	}
+
 	cs.trMgr.Reserve(ctx, pod)
 	return nil
 }
@@ -250,8 +359,19 @@ func (cs *KusciaScheduling) PreBind(ctx context.Context, state *framework.CycleS
 }
 
 // PostBind is called after a pod is successfully bound. These plugins are used update TaskResource when pod is bound.
+// Also used to cache the node assignment for pods with the same job-id.
 func (cs *KusciaScheduling) PostBind(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeName string) {
-	nlog.Infof("PostBind pod %v/%v", pod.Namespace, pod.Name)
+	nlog.Infof("PostBind pod %v/%v to node %v", pod.Namespace, pod.Name, nodeName)
+
+	// Cache the node assignment for pods with the same job-id if scheduleAffinity is RequireSameNode
+	if jobID := getJobIDFromPod(pod); jobID != "" {
+		if isRequireSameNode(pod) {
+			// Store the node name for this job ID in the cache
+			cs.jobIDCache.Set(jobID, nodeName)
+			nlog.Debugf("Cached node %s for job-id %s", nodeName, jobID)
+		}
+	}
+
 	_, tr, _ := cs.trMgr.GetTaskResource(pod)
 	if tr == nil {
 		return

@@ -77,6 +77,13 @@ type KusciaJobSpec struct {
 	// +kubebuilder:validation:Enum=Strict;BestEffort
 	// +kubebuilder:default=Strict
 	ScheduleMode KusciaJobScheduleMode `json:"scheduleMode,omitempty"`
+	// ScheduleAffinity defines the pod affinity policy when scheduling a job.
+	// In RequireSameNode, all tasks under this job will be scheduled to the same node.
+	// In None, there is no affinity policy for scheduling this job.
+	// +optional
+	// +kubebuilder:validation:Enum=RequireSameNode;None
+	// +kubebuilder:default=None
+	ScheduleAffinity KusciaJobScheduleAffinity `json:"scheduleAffinity,omitempty"`
 	// MaxParallelism max parallelism of tasks, default 1.
 	// At a certain moment, there may be multiple subtasks that can be scheduled.
 	// this field defines the maximum number of tasks in the Running state.
@@ -231,6 +238,16 @@ const (
 	// But the successor subtask of the failed subtask stops scheduling, and the current state will be running.
 	// When all subtasks succeed or fail, the job will enter the Failed state.
 	KusciaJobScheduleModeBestEffort KusciaJobScheduleMode = "BestEffort"
+)
+
+// KusciaJobScheduleAffinity defines the pod affinity policy when scheduling a job.
+type KusciaJobScheduleAffinity string
+
+const (
+	// KusciaJobScheduleAffinityRequireSameNode means that all tasks under this job will be scheduled to the same node.
+	KusciaJobScheduleAffinityRequireSameNode KusciaJobScheduleAffinity = "RequireSameNode"
+	// KusciaJobScheduleAffinityNone means that there is no affinity policy for scheduling this job.
+	KusciaJobScheduleAffinityNone KusciaJobScheduleAffinity = "None"
 )
 
 // KusciaJobConditionType is a valid value for a kuscia job condition type.

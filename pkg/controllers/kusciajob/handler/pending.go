@@ -51,6 +51,14 @@ func (h *PendingHandler) handlePending(job *kusciaapisv1alpha1.KusciaJob) (needU
 	if hasReconciled, err := h.handleStageCommand(now, job); err != nil || hasReconciled {
 		return hasReconciled, err
 	}
+
+	// Check if the job requires scheduling to the same node
+	if job.Spec.ScheduleAffinity == kusciaapisv1alpha1.KusciaJobScheduleAffinityRequireSameNode {
+		nlog.Infof("Job %s requires scheduling to the same node", job.Name)
+		// Additional logic for RequireSameNode can be added here if needed
+		// For example, validating that all parties can be scheduled to the same node
+	}
+
 	// the logic of handle pending status is no different between  self as initiator or as partner
 	// all partner have been created success
 	if isBFIAInterConnJob(h.namespaceLister, job) { // BFIA must checkout Start Stage
